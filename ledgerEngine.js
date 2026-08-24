@@ -367,34 +367,70 @@ export async function updateDashboardStats(supabase, selectedPropertyId = 'all',
 }
 
 /** Public batch helper: current-month water reading + payment status per unit. Pass [{tenant, unitId}]. */
+/** Every reading for a set of tenants, keyed by tenant then month — the shared building
+ *  block for both the card badge and the full per-month ledger in the drawer. */
+async function fetchReadingsByTenantMonth(supabase, tenantIds) {
+  const map = {};
+  if (tenantIds.length === 0) return map;
+  const { data } = await supabase.from('water_readings')
+    .select('tenant_id, period_month, prev_reading, curr_reading, units_consumed, total_cost, reading_date, id')
+    .in('tenant_id', tenantIds);
+  (data || []).forEach(r => {
+    const mk = monthKey(r.period_month);
+    map[r.tenant_id] = map[r.tenant_id] || {};
+    map[r.tenant_id][mk] = r;
+  });
+  return map;
+}
+
+/** Walks every month from the tenant's billing anchor (same one rent uses) to now,
+ *  flagging which ones have no logged reading at all — not just whether this month is set. */
+function computeWaterTrackingStatus(readingsByMonth, anchorDateStr) {
+  const anchorKey = monthKey(anchorDateStr);
+  const nowKey = monthKey(new Date());
+  const missingKeys = [];
+  for (let k = anchorKey; k <= nowKey; k++) {
+    if (!readingsByMonth || !readingsByMonth[k]) missingKeys.push(k);
+  }
+  return {
+    missingCount: missingKeys.length,
+    earliestMissingLabel: missingKeys.length > 0 ? monthLabel(monthKeyToDate(missingKeys[0])) : null,
+    missingMonthKeys: missingKeys,
+    currentReading: (readingsByMonth && readingsByMonth[nowKey]) || null
+  };
+}
+
+/** Public batch helper for unit cards: missing-months gap (mirrors rent's LATE tracking)
+ *  plus this month's paid/unpaid status when nothing's missing. */
 export async function getWaterStatuses(supabase, tenantUnitPairs) {
-  const unitIds = tenantUnitPairs.map(p => p.unitId);
   const tenantIds = tenantUnitPairs.map(p => p.tenant.id);
   const result = {};
-  if (unitIds.length === 0) return result;
+  if (tenantIds.length === 0) return result;
+
+  const readingsByTenantMonth = await fetchReadingsByTenantMonth(supabase, tenantIds);
 
   const currentMonthIso = currentMonthFirstLocal();
-
-  const { data: readings } = await supabase.from('water_readings')
-    .select('unit_id, period_month, units_consumed, total_cost')
-    .in('unit_id', unitIds).eq('period_month', currentMonthIso);
-
   const { data: payments } = await supabase.from('payment_logs')
     .select('tenant_id, amount_paid')
     .in('tenant_id', tenantIds).eq('payment_type', 'water').eq('period_month', currentMonthIso);
-
   const paidByTenant = {};
   (payments || []).forEach(p => { paidByTenant[p.tenant_id] = (paidByTenant[p.tenant_id] || 0) + (parseFloat(p.amount_paid) || 0); });
 
-  const readingByUnit = {};
-  (readings || []).forEach(r => { readingByUnit[r.unit_id] = r; });
-
-  tenantUnitPairs.forEach(({ tenant, unitId }) => {
-    const reading = readingByUnit[unitId];
-    if (!reading) { result[tenant.id] = { logged: false }; return; }
-    const cost = parseFloat(reading.total_cost) || 0;
+  tenantUnitPairs.forEach(({ tenant }) => {
+    const tracking = computeWaterTrackingStatus(readingsByTenantMonth[tenant.id], billingAnchor(tenant));
+    const reading = tracking.currentReading;
+    const logged = !!reading;
+    const cost = logged ? (parseFloat(reading.total_cost) || 0) : 0;
     const paid = paidByTenant[tenant.id] || 0;
-    result[tenant.id] = { logged: true, consumed: reading.units_consumed, cost, paid, isPaid: paid >= cost };
+    result[tenant.id] = {
+      logged,
+      consumed: logged ? reading.units_consumed : null,
+      cost,
+      paid,
+      isPaid: logged ? paid >= cost : false,
+      missingCount: tracking.missingCount,
+      earliestMissingLabel: tracking.earliestMissingLabel
+    };
   });
 
   return result;
@@ -683,30 +719,53 @@ function openSurplusAllocationModal(supabase, unit, tenant, surplus, periodMonth
 
 // --- WATER LOGGING MODULE ---
 
-export async function loadWaterReadings(supabase, unitId) {
+export async function loadWaterReadings(supabase, unit, tenant) {
   const tbody = document.getElementById('water-table-body');
   if (!tbody) return;
 
-  const { data: readings, error } = await supabase
-    .from('water_readings').select('*').eq('unit_id', unitId).order('reading_date', { ascending: false });
+  const { data: readings } = await supabase
+    .from('water_readings').select('*').eq('unit_id', unit.id);
 
-  if (error || !readings || readings.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">No water reading records found.</td></tr>';
+  const readingByMonth = {};
+  (readings || []).forEach(r => { readingByMonth[monthKey(r.period_month)] = r; });
+
+  const anchorKey = monthKey(billingAnchor(tenant));
+  const nowKey = monthKey(new Date());
+  const rows = [];
+  for (let k = nowKey; k >= anchorKey; k--) rows.push({ key: k, reading: readingByMonth[k] || null });
+
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">No tracked months yet.</td></tr>';
     return;
   }
 
-  tbody.innerHTML = readings.map(r => {
-    const rDate = parseLocalDate(r.reading_date || r.created_at);
-    const periodLabel = parseLocalDate(r.period_month).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+  tbody.innerHTML = rows.map(row => {
+    const monthDate = monthKeyToDate(row.key);
+    const periodLabel = monthLabel(monthDate);
+    const r = row.reading;
+
+    if (r) {
+      const rDate = parseLocalDate(r.reading_date || r.created_at);
+      return `
+        <tr data-reading-id="${r.id}">
+          <td>${rDate.toLocaleDateString()}</td>
+          <td><strong>${periodLabel}</strong></td>
+          <td>${r.prev_reading}</td>
+          <td>${r.curr_reading}</td>
+          <td>${r.units_consumed} m³</td>
+          <td>KES ${(parseFloat(r.total_cost) || 0).toLocaleString()}</td>
+          <td><button class="btn-icon-delete" data-delete-reading="${r.id}" title="Delete" aria-label="Delete">&times;</button></td>
+        </tr>
+      `;
+    }
+
     return `
-      <tr data-reading-id="${r.id}">
-        <td>${rDate.toLocaleDateString()}</td>
+      <tr style="background:rgba(217,119,6,0.08);">
+        <td>—</td>
         <td><strong>${periodLabel}</strong></td>
-        <td>${r.prev_reading}</td>
-        <td>${r.curr_reading}</td>
-        <td>${r.units_consumed} m³</td>
-        <td>KES ${(parseFloat(r.total_cost) || 0).toLocaleString()}</td>
-        <td><button class="btn-icon-delete" data-delete-reading="${r.id}" title="Delete" aria-label="Delete">&times;</button></td>
+        <td colspan="3" style="color:var(--warning); font-weight:600;">Not recorded</td>
+        <td></td>
+        <td><button type="button" class="btn btn-secondary btn-log-missing-month" data-month="${toLocalISODate(monthDate)}" style="padding:0.2rem 0.5rem; font-size:0.78rem;">Log</button></td>
       </tr>
     `;
   }).join('');
@@ -716,12 +775,18 @@ export async function loadWaterReadings(supabase, unitId) {
       const okDeleteReading = await showConfirm({ title: 'Delete Water Reading', message: 'Delete this water reading? This cannot be undone.', confirmLabel: 'Delete', danger: true });
       if (!okDeleteReading) return;
       await supabase.from('water_readings').delete().eq('id', btn.dataset.deleteReading);
-      loadWaterReadings(supabase, unitId);
+      loadWaterReadings(supabase, unit, tenant);
+    });
+  });
+
+  tbody.querySelectorAll('.btn-log-missing-month').forEach(btn => {
+    btn.addEventListener('click', () => {
+      openWaterModal(supabase, unit, tenant, null, () => loadWaterReadings(supabase, unit, tenant), btn.dataset.month);
     });
   });
 }
 
-export async function openWaterModal(supabase, unit, tenant, selectedDate, onSuccess) {
+export async function openWaterModal(supabase, unit, tenant, selectedDate, onSuccess, presetMonth) {
   const modalOverlay = document.getElementById('modal-overlay');
   const modalTitle = document.getElementById('modal-title');
   const modalBody = document.getElementById('modal-body');
@@ -748,7 +813,7 @@ export async function openWaterModal(supabase, unit, tenant, selectedDate, onSuc
   modalBody.innerHTML = `
     <form id="water-form">
       <div class="form-group"><label for="water-date">Reading Date</label><input type="date" id="water-date" value="${todayStr}" required /></div>
-      <div class="form-group"><label for="water-month">Reading Month</label><input type="month" id="water-month" value="${todayStr.slice(0,7)}" required /></div>
+      <div class="form-group"><label for="water-month">Reading Month</label><input type="month" id="water-month" value="${(presetMonth || todayStr).slice(0,7)}" required /></div>
       <p id="water-existing-note" style="font-size:0.82rem; color:var(--warning); display:none;"></p>
       <div class="form-group"><label for="water-prev">Previous Meter Reading</label><input type="number" id="water-prev" value="${prevDefault}" step="0.1" required /></div>
       <div class="form-group"><label for="water-curr">Current Meter Reading</label><input type="number" id="water-curr" placeholder="e.g. 135" step="0.1" required /></div>
@@ -820,7 +885,7 @@ export async function openWaterModal(supabase, unit, tenant, selectedDate, onSuc
       if (updateError) { showToast('Error updating water log: ' + updateError.message, 'error'); return; }
 
       modalOverlay.style.display = 'none';
-      loadWaterReadings(supabase, unit.id);
+      loadWaterReadings(supabase, unit, tenant);
       if (onSuccess) onSuccess();
       return;
     }
@@ -838,7 +903,7 @@ export async function openWaterModal(supabase, unit, tenant, selectedDate, onSuc
     if (error) { showToast('Error saving water log: ' + error.message, 'error'); return; }
 
     modalOverlay.style.display = 'none';
-    loadWaterReadings(supabase, unit.id);
+    loadWaterReadings(supabase, unit, tenant);
     if (onSuccess) onSuccess();
   };
 
@@ -1505,6 +1570,142 @@ export async function loadMaintenanceList(supabase, propertyId = 'all') {
       if (!okDeleteMaint) return;
       await supabase.from('maintenance_logs').delete().eq('id', btn.dataset.deleteMaint);
       loadMaintenanceList(supabase, propertyId);
+    });
+  });
+}
+
+// --- WATER BILL RECONCILIATION (property-level: billed vs metered vs collected) ---
+
+export async function openLogWaterBillModal(supabase, propertyId, onSuccess) {
+  const modalOverlay = document.getElementById('modal-overlay');
+  const modalTitle = document.getElementById('modal-title');
+  const modalBody = document.getElementById('modal-body');
+
+  modalTitle.textContent = 'Log Water Bill';
+  modalBody.innerHTML = `
+    <form id="water-bill-form">
+      <div class="form-group"><label for="wb-period">Billing Period</label><input type="month" id="wb-period" value="${currentMonthFirstLocal().slice(0, 7)}" required /></div>
+      <div class="form-group"><label for="wb-amount">Bill Amount (KES)</label><input type="number" id="wb-amount" step="0.01" min="0" required /></div>
+      <div class="form-group"><label for="wb-notes">Notes (optional)</label><input type="text" id="wb-notes" placeholder="e.g. includes an estimated reading" /></div>
+      <p style="font-size:0.82rem; color:var(--text-muted);">Logging a period that's already been billed will overwrite it.</p>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" id="cancel-wb-btn">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+  `;
+  modalOverlay.style.display = 'flex';
+
+  document.getElementById('water-bill-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const [y, m] = document.getElementById('wb-period').value.split('-');
+    const periodMonth = `${y}-${m}-01`;
+    const billAmount = parseFloat(document.getElementById('wb-amount').value);
+    const notes = document.getElementById('wb-notes').value.trim() || null;
+
+    const { error } = await supabase.from('property_water_bills').upsert(
+      { property_id: propertyId, period_month: periodMonth, bill_amount: billAmount, notes },
+      { onConflict: 'property_id,period_month' }
+    );
+
+    if (error) { showToast('Error saving water bill: ' + error.message, 'error'); return; }
+    modalOverlay.style.display = 'none';
+    if (onSuccess) onSuccess();
+  };
+
+  document.getElementById('cancel-wb-btn').onclick = () => { modalOverlay.style.display = 'none'; };
+  document.getElementById('close-modal-btn').onclick = () => { modalOverlay.style.display = 'none'; };
+}
+
+/**
+ * Three-way comparison per billed period for a property:
+ * Billed (what the water company charged) vs Metered (sum of unit readings' cost, what the
+ * meters say usage should be) vs Collected (sum of tenant water payments). The gap between
+ * Billed and Metered is common-area usage/loss; the gap between Metered and Collected is arrears.
+ * Only meaningful per-property — hidden entirely when "All Properties" is selected.
+ */
+export async function loadWaterReconciliation(supabase, propertyId) {
+  const wrapper = document.getElementById('water-reconciliation-wrapper');
+  const container = document.getElementById('water-reconciliation-list');
+  if (!wrapper || !container) return;
+
+  if (!propertyId || propertyId === 'all') {
+    wrapper.style.display = 'none';
+    return;
+  }
+  wrapper.style.display = 'block';
+  container.innerHTML = '<p style="color:var(--text-muted);">Loading…</p>';
+
+  const { data: bills } = await supabase.from('property_water_bills')
+    .select('*').eq('property_id', propertyId).order('period_month', { ascending: false });
+
+  if (!bills || bills.length === 0) {
+    container.innerHTML = '<p style="color:var(--text-muted);">No water bills logged for this property yet. Log one to start reconciling billed vs. metered vs. collected.</p>';
+    return;
+  }
+
+  const { data: units } = await supabase.from('units').select('id').eq('property_id', propertyId);
+  const unitIds = (units || []).map(u => u.id);
+  const periods = bills.map(b => b.period_month);
+
+  let meteredByPeriod = {};
+  if (unitIds.length > 0) {
+    const { data: readings } = await supabase.from('water_readings')
+      .select('period_month, total_cost').in('unit_id', unitIds).in('period_month', periods);
+    (readings || []).forEach(r => {
+      meteredByPeriod[r.period_month] = (meteredByPeriod[r.period_month] || 0) + (parseFloat(r.total_cost) || 0);
+    });
+  }
+
+  let collectedByPeriod = {};
+  if (unitIds.length > 0) {
+    const { data: tenants } = await supabase.from('tenants').select('id').in('unit_id', unitIds);
+    const tenantIds = (tenants || []).map(t => t.id);
+    if (tenantIds.length > 0) {
+      const { data: payments } = await supabase.from('payment_logs')
+        .select('period_month, amount_paid').in('tenant_id', tenantIds).eq('payment_type', 'water').in('period_month', periods);
+      (payments || []).forEach(p => {
+        collectedByPeriod[p.period_month] = (collectedByPeriod[p.period_month] || 0) + (parseFloat(p.amount_paid) || 0);
+      });
+    }
+  }
+
+  container.innerHTML = `
+    <table class="data-table">
+      <thead><tr><th>Period</th><th>Billed</th><th>Metered (Units)</th><th>Collected (Tenants)</th><th>Unaccounted</th><th>Collection Gap</th><th></th></tr></thead>
+      <tbody>
+        ${bills.map(b => {
+          const billed = parseFloat(b.bill_amount) || 0;
+          const metered = meteredByPeriod[b.period_month] || 0;
+          const collected = collectedByPeriod[b.period_month] || 0;
+          const unaccounted = billed - metered;
+          const gap = metered - collected;
+          return `
+            <tr>
+              <td><strong>${parseLocalDate(b.period_month).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })}</strong>${b.notes ? `<div style="font-size:0.75rem; color:var(--text-muted);">${b.notes}</div>` : ''}</td>
+              <td>KES ${billed.toLocaleString()}</td>
+              <td>KES ${metered.toLocaleString()}</td>
+              <td>KES ${collected.toLocaleString()}</td>
+              <td style="color:${unaccounted > 0 ? 'var(--warning)' : 'var(--success)'}; font-weight:600;">KES ${unaccounted.toLocaleString()}</td>
+              <td style="color:${gap > 0 ? 'var(--danger)' : 'var(--success)'}; font-weight:600;">KES ${gap.toLocaleString()}</td>
+              <td><button class="btn-icon-delete" data-delete-bill="${b.id}" title="Delete" aria-label="Delete">&times;</button></td>
+            </tr>
+          `;
+        }).join('')}
+      </tbody>
+    </table>
+    <p style="font-size:0.78rem; color:var(--text-muted); margin-top:0.5rem;">
+      <strong>Unaccounted</strong> = billed minus what your unit meters say usage should cost — likely common-area use, leaks, or estimate variance.
+      <strong>Collection Gap</strong> = metered cost minus what tenants have actually paid so far.
+    </p>
+  `;
+
+  container.querySelectorAll('[data-delete-bill]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const ok = await showConfirm({ title: 'Delete Water Bill', message: 'Delete this water bill record? This cannot be undone.', confirmLabel: 'Delete', danger: true });
+      if (!ok) return;
+      await supabase.from('property_water_bills').delete().eq('id', btn.dataset.deleteBill);
+      loadWaterReconciliation(supabase, propertyId);
     });
   });
 }

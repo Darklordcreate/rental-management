@@ -28,6 +28,8 @@ import {
   openMovedOutTenantsModal,
   openLogMaintenanceModal,
   loadMaintenanceList,
+  openLogWaterBillModal,
+  loadWaterReconciliation,
   parseLocalDate,
   todayLocalISO,
   showToast,
@@ -162,6 +164,19 @@ function setupActionButtons() {
       });
     });
   }
+
+  const logWaterBillBtn = document.getElementById('log-water-bill-btn');
+  if (logWaterBillBtn) {
+    logWaterBillBtn.addEventListener('click', () => {
+      const activeTab = document.querySelector('.tab-btn.active');
+      const propertyId = activeTab ? activeTab.dataset.propertyId : 'all';
+      if (!propertyId || propertyId === 'all') {
+        showToast('Select a specific property tab first — water bills are per-property.', 'info');
+        return;
+      }
+      openLogWaterBillModal(supabase, propertyId, () => loadWaterReconciliation(supabase, propertyId));
+    });
+  }
 }
 
 // --- DATA FETCHING & RENDERING ---
@@ -234,6 +249,7 @@ async function loadUnitsForProperty(propertyId) {
   unitsGrid.innerHTML = '<p>Loading units...</p>';
   updateDashboardStats(supabase, propertyId, currentRange);
   loadMaintenanceList(supabase, propertyId);
+  loadWaterReconciliation(supabase, propertyId);
 
   let query = supabase.from('units').select(`
     id, house_number, base_rent, status, property_id,
@@ -275,11 +291,12 @@ async function loadUnitsForProperty(propertyId) {
 
     let waterHtml = '';
     if (activeTenant) {
-      if (!water || !water.logged) {
-        waterHtml = `<p style="font-size:0.8rem; color:var(--warning);">💧 Water not logged this month</p>`;
-      } else if (water.isPaid) {
+      if (water && water.missingCount > 0) {
+        const monthWord = water.missingCount > 1 ? 'months' : 'month';
+        waterHtml = `<p style="font-size:0.8rem; color:var(--warning); font-weight:600;">💧 ${water.missingCount} ${monthWord} of readings missing since ${water.earliestMissingLabel}</p>`;
+      } else if (water && water.isPaid) {
         waterHtml = `<p style="font-size:0.8rem; color:var(--success);">💧 ${water.consumed} m³ — paid</p>`;
-      } else {
+      } else if (water) {
         const owing = water.cost - water.paid;
         waterHtml = `<p style="font-size:0.8rem; color:var(--warning);">💧 ${water.consumed} m³ — KES ${owing.toLocaleString()} unpaid</p>`;
       }
@@ -519,7 +536,7 @@ export async function openTenantDrawer(unit, tenant) {
     };
 
     loadTenantLedger(supabase, tenant.id);
-    loadWaterReadings(supabase, unit.id);
+    loadWaterReadings(supabase, unit, tenant);
     loadDocuments(supabase, unit.id, tenant.id);
   } else {
     metaBanner.style.display = 'none';
