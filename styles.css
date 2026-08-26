@@ -216,7 +216,9 @@ body {
 .drawer-content { 
   padding: 1.5rem; 
   flex: 1; 
+  min-width: 0;
   overflow-y: auto; 
+  overflow-x: auto;
 }
 
 .tab-pane { display: none; }
@@ -499,8 +501,13 @@ body.dark-theme .btn-close { color: var(--text-muted); }
   .pane-actions, #drawer-action-container { display: flex; flex-wrap: wrap; gap: 0.5rem; }
   #drawer-action-container button { margin-left: 0 !important; }
 
-  .drawer-content { overflow-x: auto; }
-  .data-table { min-width: 480px; }
+  .drawer-content { overflow-x: auto; padding: 1rem 0.75rem; }
+  .data-table { width: 100%; }
+  .data-table th,
+  .data-table td {
+    padding: 0.4rem 0.25rem;
+    font-size: 0.72rem;
+  }
 
   .modal-content { width: 94%; max-width: 94%; padding: 1rem; max-height: 88vh; overflow-y: auto; }
   .modal-actions { flex-wrap: wrap; }
