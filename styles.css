@@ -18,10 +18,15 @@
   font-family: system-ui, -apple-system, sans-serif; 
 }
 
+html {
+  background: var(--bg-color);
+}
+
 body {
   background: var(--bg-color);
   color: var(--text-main);
   line-height: 1.5;
+  overflow-x: hidden;
 }
 
 .navbar { 
@@ -167,12 +172,20 @@ body {
   align-items: flex-start; 
 }
 
+/* Flex items default to min-width:auto, which blocks shrinking below their content's
+   natural width — this is what was forcing the drawer wider than the screen on mobile
+   whenever the tenant name + LATE badge + expected/paid text got long. */
+.drawer-header > div { min-width: 0; flex: 1; }
+#drawer-unit-title { overflow-wrap: break-word; }
+#drawer-tenant-name { overflow-wrap: break-word; word-break: break-word; }
+
 .btn-close { 
   background: none; 
   border: none; 
   font-size: 1.75rem; 
   cursor: pointer; 
   color: var(--text-muted); 
+  flex-shrink: 0;
 }
 
 /* Drawer Tabs & Tables */
@@ -184,12 +197,14 @@ body {
 
 .drawer-tab-btn { 
   flex: 1; 
+  min-width: 0;
   padding: 0.75rem; 
   border: none; 
   background: none; 
   cursor: pointer; 
   font-weight: 600; 
   color: var(--text-muted); 
+  white-space: normal;
 }
 
 .drawer-tab-btn.active { 
@@ -286,9 +301,10 @@ body {
 /* Tenant Header Info Bar */
 .tenant-meta-banner {
   display: flex;
+  flex-wrap: wrap;
   gap: 20px;
-  background-color: #f8fafc;
-  border: 1px solid #e2e8f0;
+  background-color: var(--bg-color);
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px 12px;
   margin-top: 10px;
@@ -299,21 +315,22 @@ body {
   display: flex;
   gap: 6px;
   align-items: center;
+  min-width: 0;
 }
 
 .meta-label {
-  color: #64748b;
+  color: var(--text-muted);
   font-weight: 500;
 }
 
 .meta-value {
-  color: #0f172a;
+  color: var(--text-main);
   font-weight: 600;
 }
 
 .meta-month-input {
   border: 1px solid var(--border);
-  background: #ffffff;
+  background: var(--card-bg);
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 0.85rem;
@@ -393,6 +410,7 @@ body {
 }
 
 /* --- Dark mode --- */
+html.dark-theme,
 body.dark-theme {
   --bg-color: #0f172a;
   --card-bg: #1e293b;
@@ -469,6 +487,8 @@ body.dark-theme .btn-close { color: var(--text-muted); }
 
   #period-selector { gap: 0.4rem; }
   #period-selector span { flex-wrap: wrap; margin-left: 0 !important; width: 100%; }
+  #custom-range-panel { gap: 0.5rem; }
+  #custom-range-panel input[type="date"] { flex: 1 1 auto; min-width: 0; }
 
   .section-header { flex-wrap: wrap; gap: 0.5rem; }
 

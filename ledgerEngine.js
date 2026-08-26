@@ -1154,10 +1154,11 @@ export async function openSettingsModal(supabase) {
 
 export function initTheme() {
   const saved = localStorage.getItem('rm-theme');
-  if (saved === 'dark') document.body.classList.add('dark-theme');
+  if (saved === 'dark') { document.documentElement.classList.add('dark-theme'); document.body.classList.add('dark-theme'); }
 }
 
 export function toggleTheme() {
+  document.documentElement.classList.toggle('dark-theme');
   document.body.classList.toggle('dark-theme');
   localStorage.setItem('rm-theme', document.body.classList.contains('dark-theme') ? 'dark' : 'light');
 }

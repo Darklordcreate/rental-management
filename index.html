@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light dark" />
   <title>Rental Manager</title>
   <link rel="stylesheet" href="styles.css" />
   <link rel="manifest" href="manifest.json" />
@@ -121,22 +122,24 @@
       </nav>
       <p id="property-target-progress" class="subtitle" style="display:none; margin:-1rem 0 1rem; font-size:0.85rem;"></p>
 
-      <div id="period-selector" style="display:flex; align-items:center; gap:0.5rem; margin-bottom:1rem; flex-wrap:wrap;">
+      <div id="period-selector" style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.75rem; flex-wrap:wrap;">
         <button class="tab-btn period-btn active" data-period="todate">To Date</button>
         <button class="tab-btn period-btn" data-period="month">This Month</button>
         <button class="tab-btn period-btn" data-period="3m">3 Months</button>
         <button class="tab-btn period-btn" data-period="6m">6 Months</button>
         <button class="tab-btn period-btn" data-period="1y">1 Year</button>
-        <span style="display:flex; align-items:center; gap:0.4rem; margin-left:0.5rem;">
-          <input type="date" id="custom-range-start" style="padding:0.3rem; border:1px solid var(--border); border-radius:4px;" />
-          <span style="color:var(--text-muted);">to</span>
-          <input type="date" id="custom-range-end" style="padding:0.3rem; border:1px solid var(--border); border-radius:4px;" />
-          <button class="btn btn-secondary" id="apply-custom-range-btn" style="padding:0.3rem 0.6rem; font-size:0.85rem;">Apply</button>
-        </span>
+        <button class="tab-btn period-btn" data-period="custom" id="custom-period-btn">Custom</button>
         <span style="display:flex; gap:0.5rem; margin-left:auto;">
           <button class="btn btn-secondary" id="open-history-btn">View History</button>
           <button class="btn btn-secondary" id="open-moved-out-btn">Moved-Out Tenants</button>
         </span>
+      </div>
+      <div id="custom-range-panel" style="display:none; align-items:center; gap:0.5rem; margin-bottom:1rem; flex-wrap:wrap; background:var(--card-bg); border:1px solid var(--border); border-radius:8px; padding:0.75rem 1rem;">
+        <label for="custom-range-start" style="font-size:0.85rem; color:var(--text-muted);">From</label>
+        <input type="date" id="custom-range-start" style="padding:0.3rem; border:1px solid var(--border); border-radius:4px; background:var(--bg-color); color:var(--text-main);" />
+        <label for="custom-range-end" style="font-size:0.85rem; color:var(--text-muted);">To</label>
+        <input type="date" id="custom-range-end" style="padding:0.3rem; border:1px solid var(--border); border-radius:4px; background:var(--bg-color); color:var(--text-main);" />
+        <button class="btn btn-primary" id="apply-custom-range-btn" style="padding:0.3rem 0.8rem; font-size:0.85rem;">Apply</button>
       </div>
 
       <section class="stats-grid">
