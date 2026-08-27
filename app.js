@@ -202,8 +202,8 @@ async function loadProperties() {
     loadUnitsForProperty('all');
   });
 
-  const { data: { user } } = await supabase.auth.getUser();
-  const { data: settings } = await supabase.from('app_settings').select('target_property_count').eq('owner_id', user?.id).maybeSingle();
+  const { data: { session } } = await supabase.auth.getSession();
+  const { data: settings } = await supabase.from('app_settings').select('target_property_count').eq('owner_id', session?.user?.id).maybeSingle();
   const progressEl = document.getElementById('property-target-progress');
   if (progressEl) {
     if (settings?.target_property_count) {
@@ -278,8 +278,10 @@ async function loadUnitsForProperty(propertyId) {
     const activeTenant = unit.tenants?.find(t => t.status === 'active');
     if (activeTenant) tenantUnitPairs.push({ tenant: activeTenant, baseRent: unit.base_rent, unitId: unit.id });
   });
-  const trackingStatuses = await getRentTrackingStatuses(supabase, tenantUnitPairs);
-  const waterStatuses = await getWaterStatuses(supabase, tenantUnitPairs);
+  const [trackingStatuses, waterStatuses] = await Promise.all([
+    getRentTrackingStatuses(supabase, tenantUnitPairs),
+    getWaterStatuses(supabase, tenantUnitPairs)
+  ]);
 
   units.forEach(unit => {
     const activeTenant = unit.tenants?.find(t => t.status === 'active');
@@ -472,6 +474,13 @@ export async function openTenantDrawer(unit, tenant) {
   const btnUploadDoc = document.getElementById('btn-upload-doc');
 
   drawerTitle.textContent = `${unit.properties ? unit.properties.name : ''} - ${unit.house_number}`;
+  drawerTenantName.textContent = tenant ? `Tenant: ${tenant.full_name}` : 'Tenant: Vacant';
+
+  // Open right away — everything below this is async, and the click shouldn't feel frozen
+  // while it resolves. The rest of the drawer fills in a moment later.
+  drawerOverlay.classList.add('open');
+  tenantDrawer.classList.add('open');
+  actionContainer.innerHTML = '<span style="color:var(--text-muted); font-size:0.9rem;">Loading…</span>';
 
   if (btnLogWater) {
     btnLogWater.onclick = () => {
@@ -495,6 +504,15 @@ export async function openTenantDrawer(unit, tenant) {
       <div class="meta-item"><span class="meta-label">Move-in Date:</span><span class="meta-value">${displayDate}</span></div>
       <div class="meta-item"><span class="meta-label">Duration:</span><span class="meta-value" id="meta-tenancy-duration">${formatDuration(tenant.move_in_date)}</span></div>
     `;
+
+    // These don't depend on the balance calculation, so start them now rather than after —
+    // otherwise the tables sit showing the previous tenant's rows for the whole wait.
+    document.getElementById('ledger-table-body').innerHTML = '<tr><td colspan="6" style="text-align:center;">Loading…</td></tr>';
+    document.getElementById('water-table-body').innerHTML = '<tr><td colspan="7" style="text-align:center;">Loading…</td></tr>';
+    document.getElementById('document-list').innerHTML = '<li>Loading…</li>';
+    loadTenantLedger(supabase, tenant.id);
+    loadWaterReadings(supabase, unit, tenant);
+    loadDocuments(supabase, unit.id, tenant.id);
 
     const tb = await getTenantBalance(supabase, tenant, unit.base_rent);
     drawerTenantName.innerHTML = renderTenantHeaderHtml(tenant, tb);
@@ -544,9 +562,6 @@ export async function openTenantDrawer(unit, tenant) {
       loadUnitsForProperty(activeTab ? activeTab.dataset.propertyId : 'all');
     };
 
-    loadTenantLedger(supabase, tenant.id);
-    loadWaterReadings(supabase, unit, tenant);
-    loadDocuments(supabase, unit.id, tenant.id);
   } else {
     metaBanner.style.display = 'none';
     drawerTenantName.textContent = 'Tenant: Vacant';
@@ -556,9 +571,6 @@ export async function openTenantDrawer(unit, tenant) {
     document.getElementById('water-table-body').innerHTML = '<tr><td colspan="7" style="text-align:center;">Unit is vacant.</td></tr>';
     loadDocuments(supabase, unit.id, null);
   }
-
-  drawerOverlay.classList.add('open');
-  tenantDrawer.classList.add('open');
 }
 
 function openAssignTenantModal(unit) {

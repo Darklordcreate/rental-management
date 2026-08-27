@@ -26,8 +26,8 @@ export function billingAnchor(tenant) {
 }
 
 async function getCurrentUserId(supabase) {
-  const { data: { user } } = await supabase.auth.getUser();
-  return user?.id;
+  const { data: { session } } = await supabase.auth.getSession();
+  return session?.user?.id;
 }
 
 /**
@@ -445,13 +445,17 @@ export async function getWaterStatuses(supabase, tenantUnitPairs) {
  */
 export async function getTenantBalance(supabase, tenant, baseRent) {
   const rent = parseFloat(baseRent) || 0;
-  const paidMap = await fetchPaidByTenantMonth(supabase, [tenant.id]);
-  const dueDay = await getRentDueDay(supabase);
-  const tracking = computeRentTrackingStatus(paidMap[tenant.id], billingAnchor(tenant), rent, dueDay);
+  // These two are independent of each other — fetch concurrently instead of one-after-another.
+  const [paidMap, dueDay] = await Promise.all([
+    fetchPaidByTenantMonth(supabase, [tenant.id]),
+    getRentDueDay(supabase)
+  ]);
+  const tenantPaidByMonth = paidMap[tenant.id] || {};
+  const tracking = computeRentTrackingStatus(tenantPaidByMonth, billingAnchor(tenant), rent, dueDay);
 
-  const { data: payments } = await supabase
-    .from('payment_logs').select('amount_paid').eq('tenant_id', tenant.id).eq('payment_type', 'rent');
-  const collected = (payments || []).reduce((sum, p) => sum + (parseFloat(p.amount_paid) || 0), 0);
+  // collected is just the sum across every month already fetched above — no need for a
+  // second round-trip to re-fetch the same underlying payment_logs rows.
+  const collected = Object.values(tenantPaidByMonth).reduce((sum, v) => sum + v, 0);
   const months = monthsElapsedInclusive(billingAnchor(tenant));
   const expected = rent * months;
 
