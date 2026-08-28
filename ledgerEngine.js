@@ -1190,9 +1190,12 @@ export async function openHistoryModal(supabase) {
       <div class="form-group" style="flex:1;"><label for="hist-start">From</label><input type="date" id="hist-start" value="${yearAgoStr}" /></div>
       <div class="form-group" style="flex:1;"><label for="hist-end">To</label><input type="date" id="hist-end" value="${todayStr}" /></div>
     </div>
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem; flex-wrap:wrap; gap:0.5rem;">
       <button id="hist-run-btn" class="btn btn-primary">Filter</button>
+      <span style="display:flex; gap:0.5rem;">
       <button id="hist-export-btn" class="btn btn-secondary">Export CSV</button>
+      <button id="hist-export-pdf-btn" class="btn btn-secondary">Export PDF</button>
+      </span>
     </div>
     <div style="max-height:320px; overflow-y:auto;">
       <table class="data-table">
@@ -1263,26 +1266,104 @@ export async function openHistoryModal(supabase) {
   }
 
   document.getElementById('hist-run-btn').onclick = runFilter;
-  document.getElementById('hist-export-btn').onclick = () => {
+  document.getElementById('hist-export-btn').onclick = async () => {
     if (currentRows.length === 0) { showToast('No data to export — run a filter first.', 'info'); return; }
     const header = 'Date,Property/Unit,Tenant,Target Month,Type,Amount,Status\n';
     const csv = header + currentRows.map(r =>
       [r.date, r.propertyUnit, r.tenant, r.month, r.type, r.amount, r.status]
         .map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')
     ).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `payment-history-${todayLocalISO()}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const filename = `payment-history-${todayLocalISO()}.csv`;
+    await shareOrDownloadFile(csv, filename, 'text/csv');
+  };
+
+  document.getElementById('hist-export-pdf-btn').onclick = () => {
+    if (currentRows.length === 0) { showToast('No data to export — run a filter first.', 'info'); return; }
+    exportRowsAsPdf(currentRows);
   };
 
   document.getElementById('close-history-btn').onclick = () => { modalOverlay.style.display = 'none'; };
   document.getElementById('close-modal-btn').onclick = () => { modalOverlay.style.display = 'none'; };
 
   runFilter();
+}
+
+/**
+ * Blob-URL + <a download> is well known to be unreliable on mobile Safari/Chrome — it often
+ * just navigates to and displays the raw file instead of saving it, especially inside a
+ * standalone/home-screen-installed web app where there's no visible browser chrome to show a
+ * download confirmation. The Web Share API hands off to the native OS share sheet instead
+ * (Save to Files, Google Drive, WhatsApp, email), which is dramatically more reliable there.
+ * Desktop browsers generally lack file-sharing support, so they fall back to the classic
+ * download link, which works fine in that context.
+ */
+async function shareOrDownloadFile(content, filename, mimeType) {
+  const file = new File([content], filename, { type: mimeType });
+
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: filename });
+      return;
+    } catch (err) {
+      if (err && err.name === 'AbortError') return; // user cancelled the share sheet — not an error
+      // Fall through to the download-link method below on any other failure.
+    }
+  }
+
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** Opens a print-formatted view and triggers the browser's native print dialog, where the
+ *  user chooses "Save as PDF" — no PDF library needed, and this works consistently across
+ *  desktop and mobile browsers (including iOS Safari, where blob-file downloads are flaky). */
+function exportRowsAsPdf(rows) {
+  const printWindow = window.open('', '_blank');
+  if (!printWindow) { showToast('Could not open the print view — check if pop-ups are blocked.', 'error'); return; }
+
+  const totalAmount = rows.reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
+  const rowsHtml = rows.map(r => `
+    <tr>
+      <td>${r.date}</td><td>${r.propertyUnit}</td><td>${r.tenant}</td><td>${r.month}</td>
+      <td>${r.type}</td><td>KES ${r.amount.toLocaleString()}</td><td>${r.status}</td>
+    </tr>
+  `).join('');
+
+  printWindow.document.write(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8" />
+      <title>Payment History — ${todayLocalISO()}</title>
+      <style>
+        body { font-family: system-ui, -apple-system, sans-serif; padding: 1.5rem; color: #0f172a; }
+        h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
+        .subtitle { color: #64748b; margin-bottom: 1.5rem; font-size: 0.9rem; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+        th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #e2e8f0; }
+        th { background: #f1f5f9; }
+        tfoot td { font-weight: 700; border-top: 2px solid #0f172a; border-bottom: none; }
+      </style>
+    </head>
+    <body>
+      <h1>Payment History</h1>
+      <p class="subtitle">Generated ${new Date().toLocaleDateString()} — ${rows.length} record${rows.length !== 1 ? 's' : ''}</p>
+      <table>
+        <thead><tr><th>Date</th><th>Property / Unit</th><th>Tenant</th><th>Target Month</th><th>Type</th><th>Amount</th><th>Status</th></tr></thead>
+        <tbody>${rowsHtml}</tbody>
+        <tfoot><tr><td colspan="5"></td><td>KES ${totalAmount.toLocaleString()}</td><td></td></tr></tfoot>
+      </table>
+    </body>
+    </html>
+  `);
+  printWindow.document.close();
+  printWindow.focus();
+  printWindow.onload = () => printWindow.print();
 }
 
 // --- TENANT SETTINGS (name, phone, move-in date, billing start — all in one place) ---
