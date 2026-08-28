@@ -120,15 +120,18 @@ function setupActionButtons() {
   if (themeToggleBtn) themeToggleBtn.addEventListener('click', toggleTheme);
 
   const customRangePanel = document.getElementById('custom-range-panel');
+  const customPeriodBtn = document.getElementById('custom-period-btn');
 
   document.querySelectorAll('.period-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       if (btn.dataset.period === 'custom') {
         const isOpen = customRangePanel.style.display === 'flex';
         customRangePanel.style.display = isOpen ? 'none' : 'flex';
+        customPeriodBtn.setAttribute('aria-expanded', String(!isOpen));
         return; // Revealing the date pickers isn't itself a range change — wait for Apply.
       }
       customRangePanel.style.display = 'none';
+      customPeriodBtn.setAttribute('aria-expanded', 'false');
       document.querySelectorAll('.period-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       currentRange = getPresetRange(btn.dataset.period);
@@ -144,7 +147,7 @@ function setupActionButtons() {
       const endVal = document.getElementById('custom-range-end').value;
       if (!startVal && !endVal) { showToast('Pick at least one date first.', 'info'); return; }
       document.querySelectorAll('.period-btn').forEach(b => b.classList.remove('active'));
-      document.getElementById('custom-period-btn').classList.add('active');
+      customPeriodBtn.classList.add('active');
       currentRange = { start: startVal ? parseLocalDate(startVal) : null, end: endVal ? parseLocalDate(endVal) : null };
       const activeTab = document.querySelector('.tab-btn.active');
       updateDashboardStats(supabase, activeTab ? activeTab.dataset.propertyId : 'all', currentRange);
