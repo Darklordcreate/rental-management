@@ -1217,16 +1217,11 @@ export async function openHistoryModal(supabase) {
     const start = document.getElementById('hist-start').value;
     const end = document.getElementById('hist-end').value;
 
-    let unitQuery = supabase.from('units').select('id, house_number, properties(name)');
-    if (propertyId !== 'all') unitQuery = unitQuery.eq('property_id', propertyId);
-    const { data: units } = await unitQuery;
-    const unitIds = (units || []).map(u => u.id);
-    const unitById = {};
-    (units || []).forEach(u => { unitById[u.id] = u; });
+    let tenantQuery = supabase.from('tenants')
+      .select('id, full_name, unit_id, units!inner(house_number, property_id, properties(name))');
+    if (propertyId !== 'all') tenantQuery = tenantQuery.eq('units.property_id', propertyId);
+    const { data: tenants } = await tenantQuery;
 
-    if (unitIds.length === 0) { tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">No units found.</td></tr>'; currentRows = []; return; }
-
-    const { data: tenants } = await supabase.from('tenants').select('id, full_name, unit_id').in('unit_id', unitIds);
     const tenantById = {};
     (tenants || []).forEach(t => { tenantById[t.id] = t; });
     const tenantIds = (tenants || []).map(t => t.id);
@@ -1240,7 +1235,7 @@ export async function openHistoryModal(supabase) {
 
     currentRows = (payments || []).map(p => {
       const tenant = tenantById[p.tenant_id];
-      const unit = tenant ? unitById[tenant.unit_id] : null;
+      const unit = tenant ? tenant.units : null;
       return {
         date: parseLocalDate(p.payment_date).toLocaleDateString(),
         propertyUnit: unit ? `${unit.properties?.name || ''} - ${unit.house_number}` : '—',

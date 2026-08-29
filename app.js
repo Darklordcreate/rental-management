@@ -34,9 +34,9 @@ import {
   todayLocalISO,
   showToast,
   showConfirm
-} from './ledgerEngine.js';
+} from './ledgerEngine.js?v=20260828a';
 
-import { setupAuthScreen, showAuthScreen, showApp, getSession, onAuthChange, onPasswordRecovery, signOut } from './auth.js';
+import { setupAuthScreen, showAuthScreen, showApp, getSession, onAuthChange, onPasswordRecovery, signOut } from './auth.js?v=20260828a';
 
 // 1. Initialize Supabase Client
 const SUPABASE_URL = 'https://bqgdlpxydyrptiomiyev.supabase.co';
