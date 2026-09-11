@@ -1457,6 +1457,7 @@ export function openEditPropertyModal(supabase, property, onSuccess) {
         <small style="color:var(--text-muted);">Only set this if water costs differ at this property. Otherwise your Settings default applies.</small>
       </div>
       <div class="modal-actions">
+        <button type="button" class="btn btn-danger" id="delete-property-btn" style="margin-right:auto;">Delete Property</button>
         <button type="button" class="btn btn-secondary" id="cancel-ep-btn">Cancel</button>
         <button type="submit" class="btn btn-primary">Save</button>
       </div>
@@ -1474,8 +1475,37 @@ export function openEditPropertyModal(supabase, property, onSuccess) {
     modalOverlay.style.display = 'none';
     if (onSuccess) onSuccess();
   };
+  document.getElementById('delete-property-btn').onclick = async () => {
+    modalOverlay.style.display = 'none';
+    await openDeletePropertyFlow(supabase, property, onSuccess);
+  };
   document.getElementById('cancel-ep-btn').onclick = () => { modalOverlay.style.display = 'none'; };
   document.getElementById('close-modal-btn').onclick = () => { modalOverlay.style.display = 'none'; };
+}
+
+/** Deletion is gated on zero remaining units — deliberately not an automatic cascade, even
+ *  though the database itself would allow one. Forces deleting units one at a time first. */
+export async function openDeletePropertyFlow(supabase, property, onSuccess) {
+  const { count: unitCount } = await supabase.from('units').select('id', { count: 'exact', head: true }).eq('property_id', property.id);
+
+  if ((unitCount || 0) > 0) {
+    showToast(`${property.name} still has ${unitCount} unit${unitCount > 1 ? 's' : ''} — delete those first.`, 'info');
+    return;
+  }
+
+  const ok = await showConfirm({
+    title: `Delete ${property.name}`,
+    message: `Delete ${property.name}? It has no units left. This cannot be undone.`,
+    confirmLabel: 'Delete',
+    danger: true
+  });
+  if (!ok) return;
+
+  const { error } = await supabase.from('properties').delete().eq('id', property.id);
+  if (error) { showToast('Error deleting property: ' + error.message, 'error'); return; }
+
+  showToast(`${property.name} deleted.`, 'success');
+  if (onSuccess) onSuccess();
 }
 
 // --- MOVED-OUT TENANTS (view + reinstate) ---
@@ -1810,6 +1840,7 @@ export function openEditUnitModal(supabase, unit, onSuccess) {
         </select>
       </div>
       <div class="modal-actions">
+        <button type="button" class="btn btn-danger" id="delete-unit-btn" style="margin-right:auto;">Delete Unit</button>
         <button type="button" class="btn btn-secondary" id="cancel-edit-unit-btn">Cancel</button>
         <button type="submit" class="btn btn-primary">Save Changes</button>
       </div>
@@ -1827,6 +1858,80 @@ export function openEditUnitModal(supabase, unit, onSuccess) {
     modalOverlay.style.display = 'none';
     if (onSuccess) onSuccess();
   };
+  document.getElementById('delete-unit-btn').onclick = async () => {
+    modalOverlay.style.display = 'none';
+    await openDeleteUnitFlow(supabase, unit, onSuccess);
+  };
   document.getElementById('cancel-edit-unit-btn').onclick = () => { modalOverlay.style.display = 'none'; };
   document.getElementById('close-modal-btn').onclick = () => { modalOverlay.style.display = 'none'; };
+}
+
+/**
+ * Gated on vacancy (no active tenant) — mirrors the property-level safety gate one layer down.
+ * A vacant unit can still carry real history (archived tenants, payments, water readings,
+ * documents), so this counts exactly what would be destroyed and shows it before asking for
+ * confirmation, rather than a generic "are you sure?".
+ *
+ * Deletion order matters here: tenants.unit_id -> units is RESTRICT in the database, so the
+ * unit row can't be deleted while any tenant (even archived) still references it — deleting
+ * the tenants first is required, not optional, and that cascades away their payment_logs and
+ * water_readings automatically. Storage files (document uploads) are NOT covered by any SQL
+ * cascade, so those are fetched and removed explicitly, before any database deletion happens —
+ * once a row is cascade-deleted, its stored file path is gone and the file would be orphaned.
+ */
+export async function openDeleteUnitFlow(supabase, unit, onSuccess) {
+  if (unit.status !== 'vacant') {
+    showToast('Move out the tenant before deleting this unit.', 'info');
+    return;
+  }
+
+  const { data: tenants } = await supabase.from('tenants').select('id').eq('unit_id', unit.id);
+  const tenantIds = (tenants || []).map(t => t.id);
+
+  let paymentCount = 0, waterCount = 0, docCount = 0, maintCount = 0;
+  if (tenantIds.length > 0) {
+    const { count: pc } = await supabase.from('payment_logs').select('id', { count: 'exact', head: true }).in('tenant_id', tenantIds);
+    paymentCount = pc || 0;
+    const { count: wc } = await supabase.from('water_readings').select('id', { count: 'exact', head: true }).in('tenant_id', tenantIds);
+    waterCount = wc || 0;
+  }
+  const docFilter = tenantIds.length > 0 ? `unit_id.eq.${unit.id},tenant_id.in.(${tenantIds.join(',')})` : `unit_id.eq.${unit.id}`;
+  const { count: dc } = await supabase.from('documents').select('id', { count: 'exact', head: true }).or(docFilter);
+  docCount = dc || 0;
+  const { count: mc } = await supabase.from('maintenance_logs').select('id', { count: 'exact', head: true }).eq('unit_id', unit.id);
+  maintCount = mc || 0;
+
+  const parts = [];
+  if (tenantIds.length > 0) parts.push(`${tenantIds.length} past tenant${tenantIds.length > 1 ? 's' : ''}`);
+  if (paymentCount > 0) parts.push(`${paymentCount} payment record${paymentCount > 1 ? 's' : ''}`);
+  if (waterCount > 0) parts.push(`${waterCount} water reading${waterCount > 1 ? 's' : ''}`);
+  if (docCount > 0) parts.push(`${docCount} document${docCount > 1 ? 's' : ''}`);
+  if (maintCount > 0) parts.push(`${maintCount} maintenance record${maintCount > 1 ? 's' : ''}`);
+
+  const message = parts.length > 0
+    ? `This permanently deletes ${unit.house_number} and everything tied to it: ${parts.join(', ')}. This cannot be undone.`
+    : `Delete ${unit.house_number}? It has no history on record. This cannot be undone.`;
+
+  const ok = await showConfirm({ title: `Delete ${unit.house_number}`, message, confirmLabel: 'Delete', danger: true });
+  if (!ok) return;
+
+  // Clean up Storage files first, before any cascade removes the DB rows that point to them.
+  let docQuery = supabase.from('documents').select('file_url').or(docFilter);
+  const { data: docsToRemove } = await docQuery;
+  if (docsToRemove && docsToRemove.length > 0) {
+    await supabase.storage.from('tenant-documents').remove(docsToRemove.map(d => d.file_url));
+  }
+
+  // Tenants must go first — the database blocks deleting a unit while any tenant still
+  // references it. This cascades away their payments and water readings automatically.
+  if (tenantIds.length > 0) {
+    const { error: tenantError } = await supabase.from('tenants').delete().in('id', tenantIds);
+    if (tenantError) { showToast('Error clearing tenant history: ' + tenantError.message, 'error'); return; }
+  }
+
+  const { error } = await supabase.from('units').delete().eq('id', unit.id);
+  if (error) { showToast('Error deleting unit: ' + error.message, 'error'); return; }
+
+  showToast(`${unit.house_number} deleted.`, 'success');
+  if (onSuccess) onSuccess();
 }
