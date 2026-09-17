@@ -443,6 +443,33 @@ export async function getWaterStatuses(supabase, tenantUnitPairs) {
  * (not just the most recent), and `credit` is only ever non-zero when nothing is owed —
  * an overpayment on one month no longer masks an unpaid earlier month as "credit".
  */
+/**
+ * Total reallocatable credit across every overpaid month, plus which specific months it's
+ * sitting in. This is deliberately different from getTenantBalance's `credit` field, which is
+ * only non-zero when EVERY tracked month is settled — Mary Njeri's case (June and August
+ * overpaid, September still due) would show credit=0 there, even though real money is sitting
+ * idle in June and August. This walks every month independently instead.
+ */
+export async function getRentCreditBreakdown(supabase, tenant, baseRent) {
+  const rent = parseFloat(baseRent) || 0;
+  const paidMap = await fetchPaidByTenantMonth(supabase, [tenant.id]);
+  const tenantPaidByMonth = paidMap[tenant.id] || {};
+  const anchorKey = monthKey(billingAnchor(tenant));
+  const nowKey = monthKey(new Date());
+
+  const months = [];
+  let total = 0;
+  for (let k = anchorKey; k <= nowKey; k++) {
+    const paid = tenantPaidByMonth[k] || 0;
+    const surplus = paid - rent;
+    if (surplus > 0) {
+      months.push({ label: monthLabel(monthKeyToDate(k)), periodIso: toLocalISODate(monthKeyToDate(k)), surplus });
+      total += surplus;
+    }
+  }
+  return { total, months };
+}
+
 export async function getTenantBalance(supabase, tenant, baseRent) {
   const rent = parseFloat(baseRent) || 0;
   // These two are independent of each other — fetch concurrently instead of one-after-another.
@@ -719,6 +746,141 @@ function openSurplusAllocationModal(supabase, unit, tenant, surplus, periodMonth
     modalOverlay.style.display = 'none';
     if (onDone) onDone();
   };
+}
+
+/**
+ * Lets a landlord deliberately move sitting surplus from an overpaid month to wherever it's
+ * actually needed (rent for a due month, or a water bill) — the thing per-month strict
+ * accounting correctly refuses to do automatically. The amount is always capped at the
+ * selected source month's own surplus, which is what keeps this safe: the source month can
+ * never be reduced below its own base rent, so its existing status badge stays valid without
+ * needing to be recomputed.
+ */
+export async function openReallocateCreditModal(supabase, unit, tenant, onSuccess) {
+  const modalOverlay = document.getElementById('modal-overlay');
+  const modalTitle = document.getElementById('modal-title');
+  const modalBody = document.getElementById('modal-body');
+
+  const breakdown = await getRentCreditBreakdown(supabase, tenant, unit.base_rent);
+  if (breakdown.total <= 0) {
+    showToast('This tenant has no available credit to reallocate.', 'info');
+    return;
+  }
+
+  const tracking = await (async () => {
+    const dueDay = await getRentDueDay(supabase);
+    const paidMap = await fetchPaidByTenantMonth(supabase, [tenant.id]);
+    return computeRentTrackingStatus(paidMap[tenant.id], billingAnchor(tenant), parseFloat(unit.base_rent) || 0, dueDay);
+  })();
+  const defaultTargetMonth = (tracking.status !== 'PAID' ? tracking.trackingMonthIso : currentMonthFirstLocal()).slice(0, 7);
+
+  modalTitle.textContent = `Reallocate Credit: ${tenant.full_name}`;
+  const sourceOptions = breakdown.months.map(m =>
+    `<option value="${m.periodIso}" data-surplus="${m.surplus}">${m.label} — KES ${m.surplus.toLocaleString()} available</option>`
+  ).join('');
+
+  modalBody.innerHTML = `
+    <p style="font-weight:600; margin-bottom:1rem;">Available Credit: <span style="color:#0284c7;">KES ${breakdown.total.toLocaleString()}</span></p>
+    <form id="reallocate-form">
+      <div class="form-group">
+        <label for="realloc-source">Move From</label>
+        <select id="realloc-source">${sourceOptions}</select>
+      </div>
+      <div class="form-group">
+        <label for="realloc-amount">Amount to Move (KES)</label>
+        <input type="number" id="realloc-amount" min="1" step="0.01" required />
+        <small id="realloc-max-hint" style="color:var(--text-muted);"></small>
+      </div>
+      <div class="form-group">
+        <label for="realloc-target-type">Apply To</label>
+        <select id="realloc-target-type">
+          <option value="rent">Rent</option>
+          <option value="water">Water Bill</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="realloc-target-month">Target Month</label>
+        <input type="month" id="realloc-target-month" value="${defaultTargetMonth}" required />
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" id="cancel-realloc-btn">Cancel</button>
+        <button type="submit" class="btn btn-primary">Move Credit</button>
+      </div>
+    </form>
+  `;
+  modalOverlay.style.display = 'flex';
+
+  const sourceSelect = document.getElementById('realloc-source');
+  const amountInput = document.getElementById('realloc-amount');
+  const maxHint = document.getElementById('realloc-max-hint');
+
+  function updateMaxHint() {
+    const surplus = parseFloat(sourceSelect.selectedOptions[0]?.dataset.surplus || 0);
+    amountInput.max = surplus;
+    maxHint.textContent = `Up to KES ${surplus.toLocaleString()} available from this month.`;
+  }
+  sourceSelect.addEventListener('change', updateMaxHint);
+  updateMaxHint();
+
+  document.getElementById('reallocate-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const sourcePeriod = sourceSelect.value;
+    const sourceSurplus = parseFloat(sourceSelect.selectedOptions[0]?.dataset.surplus || 0);
+    const amount = parseFloat(amountInput.value);
+    const targetType = document.getElementById('realloc-target-type').value;
+    const [ty, tm] = document.getElementById('realloc-target-month').value.split('-');
+    const targetPeriod = `${ty}-${tm}-01`;
+
+    if (amount <= 0 || amount > sourceSurplus) {
+      showToast(`Amount must be between 1 and KES ${sourceSurplus.toLocaleString()}.`, 'info');
+      return;
+    }
+
+    // Reduce the source month's row(s), oldest first, never below what's needed to keep it
+    // at its own base rent — enforced above by capping the input at that month's own surplus.
+    const { data: sourceRows } = await supabase.from('payment_logs').select('id, amount_paid')
+      .eq('tenant_id', tenant.id).eq('payment_type', 'rent').eq('period_month', sourcePeriod)
+      .order('created_at', { ascending: true });
+
+    let remaining = amount;
+    for (const row of (sourceRows || [])) {
+      if (remaining <= 0) break;
+      const rowAmount = parseFloat(row.amount_paid) || 0;
+      if (rowAmount <= remaining) {
+        await supabase.from('payment_logs').delete().eq('id', row.id);
+        remaining -= rowAmount;
+      } else {
+        await supabase.from('payment_logs').update({ amount_paid: rowAmount - remaining }).eq('id', row.id);
+        remaining = 0;
+      }
+    }
+
+    const sourceLabel = parseLocalDate(sourcePeriod).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+    let status = 'ON_TIME';
+    if (targetType === 'rent') {
+      const { data: existingTarget } = await supabase.from('payment_logs').select('amount_paid')
+        .eq('tenant_id', tenant.id).eq('payment_type', 'rent').eq('period_month', targetPeriod);
+      const priorForTarget = (existingTarget || []).reduce((s, p) => s + (parseFloat(p.amount_paid) || 0), 0);
+      const dueDay = await getRentDueDay(supabase);
+      status = computeStatus(targetPeriod, todayLocalISO(), priorForTarget + amount, unit.base_rent, dueDay);
+    }
+
+    const { error } = await supabase.from('payment_logs').insert([{
+      tenant_id: tenant.id, amount_paid: amount, payment_type: targetType,
+      payment_date: todayLocalISO(), period_month: targetPeriod, status,
+      reference_code: `Reallocated from ${sourceLabel} rent surplus`
+    }]);
+
+    if (error) { showToast('Error moving credit: ' + error.message, 'error'); return; }
+
+    modalOverlay.style.display = 'none';
+    showToast(`KES ${amount.toLocaleString()} moved from ${sourceLabel} to ${targetType === 'rent' ? 'rent' : 'water bill'}.`, 'success');
+    loadTenantLedger(supabase, tenant.id);
+    if (onSuccess) onSuccess();
+  };
+
+  document.getElementById('cancel-realloc-btn').onclick = () => { modalOverlay.style.display = 'none'; };
+  document.getElementById('close-modal-btn').onclick = () => { modalOverlay.style.display = 'none'; };
 }
 
 // --- WATER LOGGING MODULE ---

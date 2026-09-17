@@ -20,6 +20,8 @@ import {
   updateDashboardStats,
   formatDuration,
   getTenantBalance,
+  getRentCreditBreakdown,
+  openReallocateCreditModal,
   getPresetRange,
   openHistoryModal,
   openTenantSettingsModal,
@@ -517,14 +519,34 @@ export async function openTenantDrawer(unit, tenant) {
     loadWaterReadings(supabase, unit, tenant);
     loadDocuments(supabase, unit.id, tenant.id);
 
-    const tb = await getTenantBalance(supabase, tenant, unit.base_rent);
+    const [tb, creditBreakdown] = await Promise.all([
+      getTenantBalance(supabase, tenant, unit.base_rent),
+      getRentCreditBreakdown(supabase, tenant, unit.base_rent)
+    ]);
     drawerTenantName.innerHTML = renderTenantHeaderHtml(tenant, tb);
+
+    const reallocateBtnHtml = creditBreakdown.total > 0
+      ? `<button id="btn-reallocate-credit" class="btn btn-secondary" style="margin-left:0.5rem;">Reallocate Credit (KES ${creditBreakdown.total.toLocaleString()})</button>`
+      : '';
 
     actionContainer.innerHTML = `
       <button id="btn-log-payment" class="btn btn-primary">+ Record Payment</button>
       <button id="btn-tenant-settings" class="btn btn-secondary" style="margin-left:0.5rem;">Tenant Settings</button>
       <button id="btn-move-out" class="btn btn-secondary" style="margin-left:0.5rem;">Move Out Tenant</button>
+      ${reallocateBtnHtml}
     `;
+
+    if (creditBreakdown.total > 0) {
+      document.getElementById('btn-reallocate-credit').onclick = () => {
+        openReallocateCreditModal(supabase, unit, tenant, () => {
+          const activeTab = document.querySelector('.tab-btn.active');
+          const scopeId = activeTab ? activeTab.dataset.propertyId : 'all';
+          updateDashboardStats(supabase, scopeId, currentRange);
+          refreshUnitCardInPlace(unit.id, scopeId);
+          openTenantDrawer(unit, tenant);
+        });
+      };
+    }
 
     document.getElementById('btn-tenant-settings').onclick = () => {
       openTenantSettingsModal(supabase, tenant, () => {
