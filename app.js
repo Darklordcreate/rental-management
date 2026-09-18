@@ -21,6 +21,7 @@ import {
   formatDuration,
   getTenantBalance,
   getRentCreditBreakdown,
+  getWaterCreditBreakdown,
   openReallocateCreditModal,
   getPresetRange,
   openHistoryModal,
@@ -519,14 +520,16 @@ export async function openTenantDrawer(unit, tenant) {
     loadWaterReadings(supabase, unit, tenant);
     loadDocuments(supabase, unit.id, tenant.id);
 
-    const [tb, creditBreakdown] = await Promise.all([
+    const [tb, rentCredit, waterCredit] = await Promise.all([
       getTenantBalance(supabase, tenant, unit.base_rent),
-      getRentCreditBreakdown(supabase, tenant, unit.base_rent)
+      getRentCreditBreakdown(supabase, tenant, unit.base_rent),
+      getWaterCreditBreakdown(supabase, unit, tenant)
     ]);
+    const combinedCredit = rentCredit.total + waterCredit.total;
     drawerTenantName.innerHTML = renderTenantHeaderHtml(tenant, tb);
 
-    const reallocateBtnHtml = creditBreakdown.total > 0
-      ? `<button id="btn-reallocate-credit" class="btn btn-secondary" style="margin-left:0.5rem;">Reallocate Credit (KES ${creditBreakdown.total.toLocaleString()})</button>`
+    const reallocateBtnHtml = combinedCredit > 0
+      ? `<button id="btn-reallocate-credit" class="btn btn-secondary" style="margin-left:0.5rem;">Reallocate Credit (KES ${combinedCredit.toLocaleString()})</button>`
       : '';
 
     actionContainer.innerHTML = `
@@ -536,7 +539,7 @@ export async function openTenantDrawer(unit, tenant) {
       ${reallocateBtnHtml}
     `;
 
-    if (creditBreakdown.total > 0) {
+    if (combinedCredit > 0) {
       document.getElementById('btn-reallocate-credit').onclick = () => {
         openReallocateCreditModal(supabase, unit, tenant, () => {
           const activeTab = document.querySelector('.tab-btn.active');

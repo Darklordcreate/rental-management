@@ -470,6 +470,40 @@ export async function getRentCreditBreakdown(supabase, tenant, baseRent) {
   return { total, months };
 }
 
+/**
+ * Same concept as getRentCreditBreakdown, but for water: compares what's been paid against
+ * the actual logged bill (water_readings.total_cost) for each month. A month only counts if
+ * BOTH a bill and a payment exist for it — a payment with no matching bill isn't "surplus",
+ * it's just unverifiable, and gets left out rather than guessed at.
+ */
+export async function getWaterCreditBreakdown(supabase, unit, tenant) {
+  const { data: readings } = await supabase.from('water_readings').select('period_month, total_cost').eq('unit_id', unit.id);
+  const billByMonth = {};
+  (readings || []).forEach(r => { billByMonth[monthKey(r.period_month)] = parseFloat(r.total_cost) || 0; });
+
+  const { data: payments } = await supabase.from('payment_logs').select('period_month, amount_paid')
+    .eq('tenant_id', tenant.id).eq('payment_type', 'water');
+  const paidByMonth = {};
+  (payments || []).forEach(p => {
+    const k = monthKey(p.period_month);
+    paidByMonth[k] = (paidByMonth[k] || 0) + (parseFloat(p.amount_paid) || 0);
+  });
+
+  const months = [];
+  let total = 0;
+  Object.keys(paidByMonth).forEach(kStr => {
+    const k = parseInt(kStr, 10);
+    const bill = billByMonth[k];
+    if (bill === undefined) return; // no reading logged for this month — nothing to compare against
+    const surplus = paidByMonth[k] - bill;
+    if (surplus > 0) {
+      months.push({ label: monthLabel(monthKeyToDate(k)), periodIso: toLocalISODate(monthKeyToDate(k)), surplus });
+      total += surplus;
+    }
+  });
+  return { total, months };
+}
+
 export async function getTenantBalance(supabase, tenant, baseRent) {
   const rent = parseFloat(baseRent) || 0;
   // These two are independent of each other — fetch concurrently instead of one-after-another.
@@ -761,8 +795,12 @@ export async function openReallocateCreditModal(supabase, unit, tenant, onSucces
   const modalTitle = document.getElementById('modal-title');
   const modalBody = document.getElementById('modal-body');
 
-  const breakdown = await getRentCreditBreakdown(supabase, tenant, unit.base_rent);
-  if (breakdown.total <= 0) {
+  const [rentBreakdown, waterBreakdown] = await Promise.all([
+    getRentCreditBreakdown(supabase, tenant, unit.base_rent),
+    getWaterCreditBreakdown(supabase, unit, tenant)
+  ]);
+  const combinedTotal = rentBreakdown.total + waterBreakdown.total;
+  if (combinedTotal <= 0) {
     showToast('This tenant has no available credit to reallocate.', 'info');
     return;
   }
@@ -775,12 +813,13 @@ export async function openReallocateCreditModal(supabase, unit, tenant, onSucces
   const defaultTargetMonth = (tracking.status !== 'PAID' ? tracking.trackingMonthIso : currentMonthFirstLocal()).slice(0, 7);
 
   modalTitle.textContent = `Reallocate Credit: ${tenant.full_name}`;
-  const sourceOptions = breakdown.months.map(m =>
-    `<option value="${m.periodIso}" data-surplus="${m.surplus}">${m.label} — KES ${m.surplus.toLocaleString()} available</option>`
-  ).join('');
+  const sourceOptions = [
+    ...rentBreakdown.months.map(m => `<option value="${m.periodIso}" data-type="rent" data-surplus="${m.surplus}">${m.label} (Rent) — KES ${m.surplus.toLocaleString()} available</option>`),
+    ...waterBreakdown.months.map(m => `<option value="${m.periodIso}" data-type="water" data-surplus="${m.surplus}">${m.label} (Water) — KES ${m.surplus.toLocaleString()} available</option>`)
+  ].join('');
 
   modalBody.innerHTML = `
-    <p style="font-weight:600; margin-bottom:1rem;">Available Credit: <span style="color:#0284c7;">KES ${breakdown.total.toLocaleString()}</span></p>
+    <p style="font-weight:600; margin-bottom:1rem;">Available Credit: <span style="color:#0284c7;">KES ${combinedTotal.toLocaleString()}</span></p>
     <form id="reallocate-form">
       <div class="form-group">
         <label for="realloc-source">Move From</label>
@@ -802,6 +841,7 @@ export async function openReallocateCreditModal(supabase, unit, tenant, onSucces
         <label for="realloc-target-month">Target Month</label>
         <input type="month" id="realloc-target-month" value="${defaultTargetMonth}" required />
       </div>
+      <p id="realloc-target-hint" style="font-size:0.85rem; color:var(--text-muted); margin-top:-0.5rem;"></p>
       <div class="modal-actions">
         <button type="button" class="btn btn-secondary" id="cancel-realloc-btn">Cancel</button>
         <button type="submit" class="btn btn-primary">Move Credit</button>
@@ -813,22 +853,66 @@ export async function openReallocateCreditModal(supabase, unit, tenant, onSucces
   const sourceSelect = document.getElementById('realloc-source');
   const amountInput = document.getElementById('realloc-amount');
   const maxHint = document.getElementById('realloc-max-hint');
+  const targetTypeSelect = document.getElementById('realloc-target-type');
+  const targetMonthInput = document.getElementById('realloc-target-month');
+  const targetHint = document.getElementById('realloc-target-hint');
 
   function updateMaxHint() {
     const surplus = parseFloat(sourceSelect.selectedOptions[0]?.dataset.surplus || 0);
+    const type = sourceSelect.selectedOptions[0]?.dataset.type || 'rent';
     amountInput.max = surplus;
-    maxHint.textContent = `Up to KES ${surplus.toLocaleString()} available from this month.`;
+    maxHint.textContent = `Up to KES ${surplus.toLocaleString()} available from this ${type === 'rent' ? 'rent' : 'water'} month.`;
   }
+
+  // Shows what's actually owed on the target side, so the amount being moved can be judged
+  // against real need instead of guessed at — this is what was missing before.
+  async function updateTargetHint() {
+    const type = targetTypeSelect.value;
+    const [ty, tm] = targetMonthInput.value.split('-');
+    const targetPeriod = `${ty}-${tm}-01`;
+    const monthLabelText = parseLocalDate(targetPeriod).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+
+    if (type === 'rent') {
+      const { data: existing } = await supabase.from('payment_logs').select('amount_paid')
+        .eq('tenant_id', tenant.id).eq('payment_type', 'rent').eq('period_month', targetPeriod);
+      const alreadyPaid = (existing || []).reduce((s, p) => s + (parseFloat(p.amount_paid) || 0), 0);
+      const rent = parseFloat(unit.base_rent) || 0;
+      const remaining = rent - alreadyPaid;
+      targetHint.textContent = remaining > 0
+        ? `${monthLabelText} rent: KES ${rent.toLocaleString()} — KES ${alreadyPaid.toLocaleString()} already paid, KES ${remaining.toLocaleString()} still needed.`
+        : `${monthLabelText} rent is already fully covered (KES ${alreadyPaid.toLocaleString()} paid of KES ${rent.toLocaleString()}). Moving more here adds to its surplus instead of settling anything.`;
+    } else {
+      const { data: reading } = await supabase.from('water_readings').select('total_cost')
+        .eq('unit_id', unit.id).eq('period_month', targetPeriod).maybeSingle();
+      if (!reading) {
+        targetHint.textContent = `No water bill logged for ${monthLabelText} yet — log a reading first to know what's actually owed.`;
+        return;
+      }
+      const bill = parseFloat(reading.total_cost) || 0;
+      const { data: existing } = await supabase.from('payment_logs').select('amount_paid')
+        .eq('tenant_id', tenant.id).eq('payment_type', 'water').eq('period_month', targetPeriod);
+      const alreadyPaid = (existing || []).reduce((s, p) => s + (parseFloat(p.amount_paid) || 0), 0);
+      const remaining = bill - alreadyPaid;
+      targetHint.textContent = remaining > 0
+        ? `${monthLabelText} water bill: KES ${bill.toLocaleString()} — KES ${alreadyPaid.toLocaleString()} already paid, KES ${remaining.toLocaleString()} still needed.`
+        : `${monthLabelText} water bill is already fully covered (KES ${alreadyPaid.toLocaleString()} paid of KES ${bill.toLocaleString()}).`;
+    }
+  }
+
   sourceSelect.addEventListener('change', updateMaxHint);
+  targetTypeSelect.addEventListener('change', updateTargetHint);
+  targetMonthInput.addEventListener('change', updateTargetHint);
   updateMaxHint();
+  updateTargetHint();
 
   document.getElementById('reallocate-form').onsubmit = async (e) => {
     e.preventDefault();
     const sourcePeriod = sourceSelect.value;
+    const sourceType = sourceSelect.selectedOptions[0]?.dataset.type || 'rent';
     const sourceSurplus = parseFloat(sourceSelect.selectedOptions[0]?.dataset.surplus || 0);
     const amount = parseFloat(amountInput.value);
-    const targetType = document.getElementById('realloc-target-type').value;
-    const [ty, tm] = document.getElementById('realloc-target-month').value.split('-');
+    const targetType = targetTypeSelect.value;
+    const [ty, tm] = targetMonthInput.value.split('-');
     const targetPeriod = `${ty}-${tm}-01`;
 
     if (amount <= 0 || amount > sourceSurplus) {
@@ -836,10 +920,10 @@ export async function openReallocateCreditModal(supabase, unit, tenant, onSucces
       return;
     }
 
-    // Reduce the source month's row(s), oldest first, never below what's needed to keep it
-    // at its own base rent — enforced above by capping the input at that month's own surplus.
+    // Reduce the source month's row(s) of the matching type, oldest first, never below what's
+    // needed to keep it at its own bill/rent — enforced above by capping at that month's surplus.
     const { data: sourceRows } = await supabase.from('payment_logs').select('id, amount_paid')
-      .eq('tenant_id', tenant.id).eq('payment_type', 'rent').eq('period_month', sourcePeriod)
+      .eq('tenant_id', tenant.id).eq('payment_type', sourceType).eq('period_month', sourcePeriod)
       .order('created_at', { ascending: true });
 
     let remaining = amount;
@@ -868,7 +952,7 @@ export async function openReallocateCreditModal(supabase, unit, tenant, onSucces
     const { error } = await supabase.from('payment_logs').insert([{
       tenant_id: tenant.id, amount_paid: amount, payment_type: targetType,
       payment_date: todayLocalISO(), period_month: targetPeriod, status,
-      reference_code: `Reallocated from ${sourceLabel} rent surplus`
+      reference_code: `Reallocated from ${sourceLabel} ${sourceType} surplus`
     }]);
 
     if (error) { showToast('Error moving credit: ' + error.message, 'error'); return; }
